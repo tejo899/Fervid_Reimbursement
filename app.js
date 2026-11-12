@@ -609,9 +609,10 @@ function previewPdf(id) {
 }
 
 function pdfFileName(claim) {
-  const safeName = (claim?.draft?.name || 'Claim').replace(/[^a-zA-Z0-9_-]+/g, '_');
+  const safeName = (claim?.draft?.name || 'Claim').replace(/[^A-Za-z0-9]/g, '_');
   const d = claim?.draft?.date || today();
-  return `Fervid_Claim_${safeName}_${d}.pdf`;
+  const shortId = String(claim?.id || 'export').slice(-8);
+  return `Reimbursement_${safeName}_${d}_${shortId}.pdf`;
 }
 
 async function share(id) {
@@ -834,88 +835,260 @@ async function ensurePdfLib() {
 
 async function renderCompanyFormPages(draft) {
   const formImg = await loadImage('./company_form.png');
-  const W = formImg.naturalWidth || 1698;
-  const H = formImg.naturalHeight || 2400;
+  const imgW = formImg.naturalWidth || 1698;
+  const imgH = formImg.naturalHeight || 2400;
 
-  const rowsPerPage = 14;
-  const expenses = draft.expenses || [];
-  const formPageCount = Math.max(1, Math.ceil(expenses.length / rowsPerPage));
+  // Match PdfExporter.java 595x842pt scaled 2.5x for crisp 1488x2105px output
+  const SCALE = 2.5;
+  const W = 595, H = 842;
+  const xs = [18, 73.5, 265.2, 318.6, 373.1, 425.6, 474, 521.3, 576.8];
 
-  const grandTotals = { travel: 0, lodging: 0, food: 0, other: 0, total: 0 };
-  for (const r of expenses) {
-    for (const k of keys) grandTotals[k] += cents(r[k]);
-    grandTotals.total += rowCents(r);
+  const clean = s => String(s ?? '').replace(/[\r\n\t]+/g, ' ').trim();
+  const fmtPlain = c => (c / 100).toFixed(2);
+
+  // Helper canvas for text measurement
+  const mCanvas = document.createElement('canvas');
+  const mCtx = mCanvas.getContext('2d');
+
+  function wrapText(txt, maxW, size, bold = false) {
+    mCtx.font = `${bold ? '700' : '400'} ${size}px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+    const words = clean(txt).split(' ');
+    const lines = [];
+    let cur = '';
+    for (const w of words) {
+      const test = cur ? cur + ' ' + w : w;
+      if (mCtx.measureText(test).width <= maxW) {
+        cur = test;
+      } else {
+        if (cur) lines.push(cur);
+        if (mCtx.measureText(w).width <= maxW) {
+          cur = w;
+        } else {
+          let part = '';
+          for (const ch of w) {
+            if (mCtx.measureText(part + ch).width > maxW && part) {
+              lines.push(part);
+              part = ch;
+            } else {
+              part += ch;
+            }
+          }
+          cur = part;
+        }
+      }
+    }
+    if (cur) lines.push(cur);
+    return lines.length ? lines : [''];
   }
 
-  const canvases = [];
-  for (let p = 0; p < formPageCount; p++) {
-    const canvas = document.createElement('canvas');
-    canvas.width = W;
-    canvas.height = H;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(formImg, 0, 0, W, H);
+  function drawText(ctx, txt, x, y, size, bold = false, align = 'left') {
+    ctx.font = `${bold ? '700' : '400'} ${size}px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+    ctx.textAlign = align;
+    ctx.fillStyle = '#1c2d38';
+    ctx.fillText(clean(txt), x, y);
+  }
 
-    ctx.fillStyle = '#141918';
-    ctx.textBaseline = 'alphabetic';
-
-    // Header fields
-    ctx.font = '600 22px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+  function drawFit(ctx, txt, x, y, maxW, size) {
+    let s = size;
+    let v = clean(txt);
     ctx.textAlign = 'left';
-    ctx.fillText(fitText(ctx, draft.purpose, 540), 214, 430);
-    ctx.fillText(fitText(ctx, draft.name, 540), 214, 470);
-    ctx.fillText(dateLabel(draft.date), 214, 510);
+    ctx.fillStyle = '#1c2d38';
+    while (s > 4.5) {
+      ctx.font = `400 ${s}px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+      if (ctx.measureText(v).width <= maxW) break;
+      s -= 0.25;
+    }
+    if (ctx.measureText(v).width > maxW) {
+      while (v.length > 0 && ctx.measureText(v + '…').width > maxW) v = v.slice(0, -1);
+      v += '…';
+    }
+    ctx.fillText(v, x, y);
+  }
 
-    ctx.fillText(fitText(ctx, draft.designation, 300), 914, 430);
-    ctx.fillText(fitText(ctx, draft.project, 300), 914, 470);
+  function drawField(ctx, label, value, x, y, width) {
+    if (ctx) drawText(ctx, label, x, y, 8, true);
+    const lines = wrapText(value, width - 66, 8, false);
+    for (const line of lines) {
+      if (ctx) {
+        drawText(ctx, line, x + 62, y, 8, false);
+        ctx.font = '400 8px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+        const lw = ctx.measureText(line).width;
+        const endX = label === 'Purpose:' ? x + 62 + Math.min(lw + 8, width - 66) : x + width - 4;
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 0.4;
+        ctx.beginPath();
+        ctx.moveTo(x + 62, y + 2);
+        ctx.lineTo(endX, y + 2);
+        ctx.stroke();
+      }
+      y += 11;
+    }
+    return y;
+  }
 
-    // Table rows
-    const slice = expenses.slice(p * rowsPerPage, (p + 1) * rowsPerPage);
-    const yStart = 637;
-    const rowH = 25.78;
-    ctx.font = '500 18px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+  function drawDetails(ctx, d) {
+    let y = 151;
+    y = drawField(ctx, 'Purpose:', d.purpose, 20, y, 555) + 4;
+    y = Math.max(
+      drawField(ctx, 'Name:', d.name, 20, y, 280),
+      drawField(ctx, 'Designation:', d.designation, 310, y, 265)
+    ) + 4;
+    y = Math.max(
+      drawField(ctx, 'Project:', d.project, 20, y, 280),
+      drawField(ctx, 'Date:', dateLabel(d.date), 310, y, 265)
+    ) + 6;
+    return y;
+  }
 
-    slice.forEach((row, idx) => {
-      const y = yStart + idx * rowH + 19;
-      ctx.textAlign = 'center';
-      ctx.fillText(dateLabel(row.date), 130, y);
+  function sliceForm(ctx, fromPt, toPt, destPt) {
+    const sy = (fromPt / H) * imgH;
+    const sh = ((toPt - fromPt) / H) * imgH;
+    ctx.drawImage(formImg, 0, sy, imgW, sh, 0, destPt, W, toPt - fromPt);
+  }
 
-      ctx.textAlign = 'left';
-      ctx.fillText(fitText(ctx, row.description, 526), 217, y);
+  const entries = draft.expenses || [];
+  const firstHeader = drawDetails(null, draft);
+  const continuedHeader = 60;
+  const tableHeaderHeight = 28.2;
+  const firstTop = firstHeader + tableHeaderHeight;
+  const continuedTop = continuedHeader + tableHeaderHeight;
+  const tableBottom = 628;
 
-      ctx.textAlign = 'center';
-      ctx.fillText(fitText(ctx, row.travel_mode || '—', 140), 831, y);
+  const heights = entries.map(row => {
+    const lines = Math.max(
+      wrapText(row.description, 187, 7).length,
+      wrapText(row.travel_mode || '', 47, 7).length
+    );
+    return Math.max(16, lines * 11 + 5);
+  });
 
-      ctx.textAlign = 'right';
-      const vals = [cents(row.travel), cents(row.lodging), cents(row.food), cents(row.other), rowCents(row)];
-      const xs = [1054, 1204, 1341, 1476, 1635];
-      vals.forEach((v, i) => {
-        if (v > 0 || i === 4) ctx.fillText(fmtNum(v), xs[i], y);
-      });
-    });
+  // Paginate matching PdfExporter.paginate()
+  const pages = [];
+  let fromIdx = 0;
+  while (fromIdx < heights.length) {
+    const avail = pages.length === 0 ? (tableBottom - firstTop) : (tableBottom - continuedTop);
+    let used = 0;
+    let toIdx = fromIdx;
+    while (toIdx < heights.length && (toIdx - fromIdx) < 25) {
+      if (used + heights[toIdx] > avail) break;
+      used += heights[toIdx++];
+    }
+    if (toIdx === fromIdx) toIdx = fromIdx + 1;
+    pages.push([fromIdx, toIdx]);
+    fromIdx = toIdx;
+  }
 
-    // Totals row (show grand totals on last page, or page totals if intermediate)
-    const isLast = p === formPageCount - 1;
-    const tVals = isLast
-      ? [grandTotals.travel, grandTotals.lodging, grandTotals.food, grandTotals.other, grandTotals.total]
-      : [
-          slice.reduce((s, r) => s + cents(r.travel), 0),
-          slice.reduce((s, r) => s + cents(r.lodging), 0),
-          slice.reduce((s, r) => s + cents(r.food), 0),
-          slice.reduce((s, r) => s + cents(r.other), 0),
-          slice.reduce((s, r) => s + rowCents(r), 0)
-        ];
+  const sums = [0, 0, 0, 0];
+  const canvases = [];
 
-    ctx.font = '700 19px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-    ctx.textAlign = 'right';
-    [1054, 1204, 1341, 1476, 1635].forEach((x, i) => {
-      ctx.fillText(fmtNum(tVals[i]), x, 1022);
-    });
+  for (let k = 0; k < pages.length; k++) {
+    const [from, to] = pages[k];
+    const last = k === pages.length - 1;
 
-    // Submitted By
-    ctx.font = '600 19px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(fitText(ctx, draft.name, 260), 1495, 1320);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(W * SCALE);
+    canvas.height = Math.round(H * SCALE);
+    const ctx = canvas.getContext('2d');
+    ctx.scale(SCALE, SCALE);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, W, H);
 
+    let headerBottom;
+    if (k === 0) {
+      sliceForm(ctx, 0, 139.3, 0);
+      drawDetails(ctx, draft);
+      headerBottom = firstHeader;
+    } else {
+      drawText(ctx, 'Expenses continued', 18, 30, 11, true);
+      drawFit(ctx, `${draft.name} | ${dateLabel(draft.date)}`, 18, 47, 558, 8);
+      headerBottom = continuedHeader;
+    }
+
+    sliceForm(ctx, 195.5, 223.7, headerBottom);
+    let y = headerBottom + tableHeaderHeight;
+
+    for (let i = from; i < to; i++) {
+      const row = entries[i];
+      const h = heights[i];
+
+      // Grid row
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(xs[0], y, xs[8] - xs[0], h);
+      ctx.fillStyle = 'rgb(225,225,225)';
+      ctx.fillRect(xs[0], y, xs[1] - xs[0], h);
+      ctx.fillStyle = 'rgb(251,218,207)';
+      ctx.fillRect(xs[7], y, xs[8] - xs[7], h);
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 0.4;
+      ctx.strokeRect(xs[0], y, xs[8] - xs[0], h);
+      for (let c = 1; c < 8; c++) {
+        ctx.beginPath();
+        ctx.moveTo(xs[c], y);
+        ctx.lineTo(xs[c], y + h);
+        ctx.stroke();
+      }
+
+      const baseline = y + (h + 7) / 2;
+      drawFit(ctx, dateLabel(row.date), xs[0] + 3, baseline, xs[1] - xs[0] - 6, 7);
+
+      let wy = y + 11;
+      for (const line of wrapText(row.description, 187, 7)) {
+        drawText(ctx, line, xs[1] + 3, wy, 7, false);
+        wy += 11;
+      }
+
+      wy = y + 11;
+      for (const line of wrapText(row.travel_mode || '', 47, 7)) {
+        drawText(ctx, line, xs[2] + 3, wy, 7, false);
+        wy += 11;
+      }
+
+      for (let j = 0; j < 4; j++) {
+        const val = cents(row[keys[j]]);
+        sums[j] += val;
+        drawFit(ctx, val === 0 ? '' : '₹ ' + fmtPlain(val), xs[j + 3] + 3, baseline, xs[j + 4] - xs[j + 3] - 6, 7);
+      }
+      drawFit(ctx, '₹ ' + fmtPlain(rowCents(row)), xs[7] + 3, baseline, xs[8] - xs[7] - 6, 7);
+      y += h;
+    }
+
+    if (last) {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(18, y, 318.6 - 18, 18);
+      ctx.fillStyle = 'rgb(251,218,207)';
+      ctx.fillRect(318.6, y, 576.8 - 318.6, 18);
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 0.4;
+      ctx.strokeRect(18, y, 576.8 - 18, 18);
+      for (let j = 3; j < xs.length - 1; j++) {
+        ctx.beginPath();
+        ctx.moveTo(xs[j], y);
+        ctx.lineTo(xs[j], y + 18);
+        ctx.stroke();
+      }
+      drawText(ctx, 'Total', 135, y + 12, 8, true);
+      let grand = 0;
+      for (let j = 0; j < 4; j++) {
+        grand += sums[j];
+        drawFit(ctx, sums[j] === 0 ? '' : '₹ ' + fmtPlain(sums[j]), xs[j + 3] + 3, y + 12, xs[j + 4] - xs[j + 3] - 6, 7);
+      }
+      drawFit(ctx, '₹ ' + fmtPlain(grand), xs[7] + 3, y + 12, xs[8] - xs[7] - 6, 7);
+      sliceForm(ctx, 361.8, 500, y + 18);
+    } else {
+      drawText(ctx, 'Continued on next page', 18, y + 16, 8, false);
+    }
+
+    // Continuous left and right borders
+    const borderTop = k === 0 ? 9 : continuedHeader;
+    const borderBottom = last ? y + 18 + (500 - 361.8) : y;
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 0.6;
+    ctx.beginPath();
+    ctx.moveTo(xs[0], borderTop); ctx.lineTo(xs[0], borderBottom);
+    ctx.moveTo(xs[8], borderTop); ctx.lineTo(xs[8], borderBottom);
+    ctx.stroke();
+
+    drawText(ctx, `Expense page ${k + 1} / ${pages.length} | Entries ${from + 1}–${to} of ${entries.length}`, 18, 816, 8, false);
     canvases.push(canvas);
   }
   return canvases;
@@ -1184,7 +1357,13 @@ async function handleSelectedFiles(fileList) {
   setReceiptBusy(true, 'Processing attachment…');
   try {
     let added = 0;
+    const totalBills = (state.draft.bills?.length || 0) + (editor.bills?.length || 0);
+    let currentCount = totalBills;
     for (const file of Array.from(fileList)) {
+      if (currentCount >= 30) {
+        toast('A claim can contain up to 30 receipt files.');
+        break;
+      }
       if (file.size > 25 * 1024 * 1024) {
         toast(`${file.name} exceeds 25 MB limit.`);
         continue;
@@ -1206,6 +1385,7 @@ async function handleSelectedFiles(fileList) {
         expenseId: editor.id
       });
       added++;
+      currentCount++;
     }
     if (added) {
       persist();
